@@ -284,7 +284,15 @@ For silent progression, set :silent-refresh in state before calling."
                       :on-failure (lambda (error)
                                     (if (and (map-elt error 'message)
                                              (string-match-p "already connected" (map-elt error 'message)))
-                                        (wasabi--log "Already connected (ignored)")
+                                        ;; wuzapi was already connected, which leaves us
+                                        ;; exactly where a successful connect would. Must
+                                        ;; set the status: the Connected notification only
+                                        ;; resumes from awaiting-connection (and friends),
+                                        ;; so staying on connect-session hangs on "Loading".
+                                        (progn
+                                          (wasabi--log "Already connected, awaiting notification")
+                                          (wasabi--set-status :type 'awaiting-connection
+                                                              :message (wasabi--make-loading-message)))
                                       (wasabi--log "Connect failed: %s" (map-elt error 'message))
                                       (wasabi--set-status :type 'error
                                                           :message (wasabi--refresh-error :message "Failed to connect"))))))
