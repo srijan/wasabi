@@ -174,8 +174,9 @@ For silent progression, set :silent-refresh in state before calling."
                         :silent (map-elt (wasabi--state) :silent-refresh)))
 
   ;; Silent flag no longer necessary after ready. Clear it.
+  ;; map-put! (not map-delete): map-delete on an alist is not in-place.
   (when (eq status-type 'ready)
-    (map-delete (wasabi--state) :silent-refresh))
+    (map-put! (wasabi--state) :silent-refresh nil))
 
   (cond
    ;; Step 1: Create client
@@ -862,6 +863,8 @@ The :connected flag tracks WhatsApp connection state (updated by notifications).
   (list (cons :client nil)
         (cons :wasabi-buffer wasabi-buffer)
         (cons :status nil)
+        ;; Pre-allocated: map-put! signals map-not-inplace on a missing key.
+        (cons :silent-refresh nil)
         ;; :connected tracks async WhatsApp connection state (set by notifications)
         (cons :connected nil)
         ;; Sample contacts structure:
