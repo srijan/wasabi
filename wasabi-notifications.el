@@ -46,12 +46,21 @@ This can be:
     (function :tag "Custom function"))
   :group 'wasabi)
 
+(defvar wasabi--notifications-unsupported-warned nil
+  "Non-nil once we've said the built-in notifications backend can't run here.")
+
 (defun wasabi--notify (message)
   "Display a notification with MESSAGE if needed."
   (when wasabi-message-notification-function
     (cond
      ((eq wasabi-message-notification-function 'notifications)
-      (wasabi--notify-with-notifications message))
+      ;; `notifications-notify' is D-Bus only. Emacs built without it (the
+      ;; stock macOS build) would signal once per incoming message.
+      (if (featurep 'dbusbind)
+          (wasabi--notify-with-notifications message)
+        (unless wasabi--notifications-unsupported-warned
+          (setq wasabi--notifications-unsupported-warned t)
+          (message "Wasabi: notifications need D-Bus, which this Emacs lacks. Set `wasabi-message-notification-function' to nil or `knockknock'."))))
      ((eq wasabi-message-notification-function 'knockknock)
       (wasabi--notify-with-knockknock message))
      ((functionp wasabi-message-notification-function)
