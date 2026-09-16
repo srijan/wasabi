@@ -1275,7 +1275,7 @@ LAST-UPDATED is the ISO timestamp string."
   (let ((time-str (when last-updated
                     (condition-case nil
                         (format-time-string "%H:%M" (parse-iso8601-time-string last-updated))
-                      (error "")))))
+                      (error nil)))))
     (concat (if is-group
                 (propertize "G" 'face 'success)
               " ")
