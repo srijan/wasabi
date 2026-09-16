@@ -115,6 +115,9 @@ The first element is the command name, and the rest are command parameters."
   :type '(repeat string)
   :group 'wasabi)
 
+(defvar wasabi--lid-map-cache nil
+  "Cached hash of \"<lid>@lid\" -> \"<pn>@s.whatsapp.net\", or nil if unread.")
+
 (defvar wasabi--admin-token "emacs-admin-token"
   "Wuzapi admin token for administrative operations.
 
@@ -305,7 +308,8 @@ For silent progression, set :silent-refresh in state before calling."
                                 :token wasabi-user-token)
                       ;; Response is an array of contacts
                       :on-success (lambda (p-contacts)
-                                    (let* ((contacts (wasabi--parse-contacts p-contacts)))
+                                    (let* ((contacts (wasabi--enrich-contacts-with-lid-names
+                                                      (wasabi--parse-contacts p-contacts))))
                                       ;; For debugging:
                                       ;; (when (seq-first p-contacts)
                                       ;;   (wasabi--log "Sample RAW contact: %s" (seq-first p-contacts)))
@@ -415,7 +419,8 @@ Invokes ON-DISCONNECTED (lambda ()) on success."
 
 
 ;; TODO: Reconsider naming and splitting into two separate requests "index" vs "jid".
-(cl-defun wasabi--send-chat-history-request (&key chat-jid contact-name on-finished)
+(cl-defun wasabi--send-chat-history-request (&key chat-jid contact-name on-finished
+                                                  history-jids prepended)
   "Fetch chat history for CHAT-JID and store in state.
 CONTACT-NAME is the display name to use for the chat buffer.
 
@@ -431,6 +436,33 @@ Invoke ON-FINISHED on success."
     (error "Not in a chats buffer"))
   (unless chat-jid
     (error ":chat-jid is required"))
+  ;; A LID-merged chat carries the JIDs its history is spread over. Drain the
+  ;; legacy ones first, accumulating into PREPENDED, then fall through to the
+  ;; live JID, which is the one that opens the buffer. A legacy fetch that
+  ;; fails just contributes nothing rather than sinking the whole chat.
+  (if-let* ((remaining (seq-remove (lambda (jid) (equal jid chat-jid)) history-jids))
+            ((consp remaining)))
+      (let ((next (car remaining))
+            (rest (cdr remaining)))
+        (acp-send-request
+         :client (map-elt (wasabi--state) :client)
+         :request (wasabi--make-chat-history-request
+                   :token wasabi-user-token
+                   :chat-jid next)
+         :on-success (lambda (response)
+                       (wasabi--log "Merged %d messages from %s"
+                                    (length (append response nil)) next)
+                       (wasabi--send-chat-history-request
+                        :chat-jid chat-jid :contact-name contact-name
+                        :on-finished on-finished :history-jids rest
+                        :prepended (append prepended (append response nil))))
+         :on-failure (lambda (error)
+                       (wasabi--log "Couldn't fetch legacy history %s: %s"
+                                    next (or (map-elt error 'message) "unknown"))
+                       (wasabi--send-chat-history-request
+                        :chat-jid chat-jid :contact-name contact-name
+                        :on-finished on-finished :history-jids rest
+                        :prepended prepended))))
   (acp-send-request :client (map-elt (wasabi--state) :client)
                     :request (wasabi--make-chat-history-request
                               :token wasabi-user-token
@@ -471,7 +503,11 @@ Invoke ON-FINISHED on success."
                                       (wasabi--refresh)))
                                    ;; Handle specific chat response: [message-array]
                                    ;; Store as alist entry: (chat-jid . p-messages)
-                                   (response
+                                   ((or response prepended)
+                                    ;; `wasabi-chat--parse-messages' sorts by
+                                    ;; timestamp, so the two JIDs' messages
+                                    ;; interleave correctly however they concat.
+                                    (setq response (append prepended (append response nil)))
                                     (map-put! (wasabi--state) :chats
                                               (map-insert (or (map-elt (wasabi--state) :chats) '())
                                                           chat-jid response))
@@ -502,7 +538,7 @@ Invoke ON-FINISHED on success."
                                     (funcall on-finished)))
                     :on-failure (lambda (error)
                                   (wasabi--log "Failed to fetch chat history for %s: %s" chat-jid (or (map-elt error 'message) "unknown"))
-                                  (message "Failed to fetch chat history"))))
+                                  (message "Failed to fetch chat history")))))
 
 (cl-defun wasabi--send-chat-send-text-request (&key phone body on-success on-failure)
   "Send a text message to PHONE with BODY.
@@ -1096,6 +1132,7 @@ Error if not found."
     (when (map-elt (wasabi--state) :client)
       (acp-shutdown :client (map-elt (wasabi--state) :client)))
     (setq wasabi--state nil)
+    (setq wasabi--lid-map-cache nil)
     (wasabi--log "==== new session ====")
     (wasabi--initialize :wasabi-buffer wasabi-buffer)))
 
@@ -1324,6 +1361,7 @@ LAST-UPDATED is the ISO timestamp string."
                                          (interactive)
                                          (wasabi--send-chat-history-request
                                           :chat-jid (map-elt chat :chat-jid)
+                                          :history-jids (map-elt chat :history-jids)
                                           :contact-name (map-elt chat :display-name)))))
                                     chats)))
                              (concat (propertize date-label 'face 'bold)
@@ -1358,6 +1396,100 @@ For example, shut down wuzapi process."
     (error "Not in a chats buffer"))
   (when (map-elt (wasabi--state) :client)
     (acp-shutdown :client (map-elt (wasabi--state) :client))))
+
+;; LID (linked identity) support.
+;;
+;; WhatsApp migrated conversations from phone JIDs ("<number>@s.whatsapp.net")
+;; to LIDs ("<id>@lid"). The same person then shows up as two chats: history
+;; under the phone JID, anything new under the LID. wuzapi exposes no bulk
+;; mapping (user.contacts has no LID field, and user.lid is a one-JID-at-a-time
+;; phone->LID lookup), but whatsmeow keeps the whole table in its own store.
+
+(defun wasabi--lid-map ()
+  "Return a hash mapping LID JIDs to phone JIDs.
+Reads whatsmeow's store directly. Returns an empty table when the
+database or Emacs's sqlite support is unavailable, so callers can treat
+a missing mapping as \"no LID migration\" rather than an error."
+  (or wasabi--lid-map-cache
+      (setq wasabi--lid-map-cache
+            (let ((table (make-hash-table :test 'equal))
+                  (db-file (expand-file-name "dbdata/main.db" (wasabi-data-dir))))
+              (when (and (sqlite-available-p) (file-exists-p db-file))
+                (condition-case err
+                    (let ((db (sqlite-open db-file)))
+                      (unwind-protect
+                          (dolist (row (sqlite-select db "select lid, pn from whatsmeow_lid_map"))
+                            (puthash (concat (car row) "@lid")
+                                     (concat (cadr row) "@s.whatsapp.net")
+                                     table))
+                        (sqlite-close db))
+                      (wasabi--log "Loaded %d LID mappings" (hash-table-count table)))
+                  (error (wasabi--log "Couldn't read LID map: %s" (error-message-string err)))))
+              table))))
+
+(defun wasabi--enrich-contacts-with-lid-names (contacts)
+  "Give LID entries in CONTACTS the name of their phone-JID counterpart.
+Most LID contacts carry no name at all (and many have no contact entry),
+so without this they render as a bare numeric JID. An existing LID name
+is left alone; this only fills gaps."
+  (let ((lid-map (wasabi--lid-map)))
+    (if (zerop (hash-table-count lid-map))
+        contacts
+      (maphash
+       (lambda (lid-jid pn-jid)
+         (let* ((lid-key (intern lid-jid))
+                (lid-contact (map-elt contacts lid-key))
+                (pn-contact (map-elt contacts (intern pn-jid)))
+                (pn-name (and pn-contact
+                              (or (map-elt pn-contact :full-name)
+                                  (map-elt pn-contact :push-name)))))
+           ;; :full-name wins over :push-name downstream, which is what we
+           ;; want: the phone side's "Nidhi" should beat the LID's "NG".
+           (when (and pn-name (not (map-elt lid-contact :full-name)))
+             (setf (map-elt contacts lid-key)
+                   `((:full-name . ,pn-name)
+                     (:push-name . ,(map-elt lid-contact :push-name)))))))
+       lid-map)
+      contacts)))
+
+(defun wasabi--merge-lid-chats (chats-index)
+  "Collapse phone-JID chats into their LID chat in CHATS-INDEX.
+The LID is the live identity: new messages arrive there and sends go
+there, so the merged entry keeps the LID as :chat-jid and records both in
+:history-jids. Only merges when both chats exist; a lone phone chat is
+left untouched."
+  (let ((lid-map (wasabi--lid-map)))
+    (if (zerop (hash-table-count lid-map))
+        chats-index
+      (let ((by-jid (make-hash-table :test 'equal))
+            (superseded (make-hash-table :test 'equal)))
+        (dolist (chat chats-index)
+          (puthash (map-elt chat :chat-jid) chat by-jid))
+        (dolist (chat chats-index)
+          (when-let* ((pn-jid (gethash (map-elt chat :chat-jid) lid-map))
+                      ((gethash pn-jid by-jid)))
+            (puthash pn-jid t superseded)))
+        ;; Rebuilt rather than mutated: `setf' on `map-elt' of an alist conses
+        ;; onto the head and rebinds the local, so the entry in the list here
+        ;; would never see the change.
+        (delq nil
+              (mapcar
+               (lambda (chat)
+                 (let* ((lid-jid (map-elt chat :chat-jid))
+                        (pn-jid (gethash lid-jid lid-map))
+                        (pn-chat (and pn-jid (gethash pn-jid by-jid))))
+                   (cond
+                    ((gethash lid-jid superseded) nil)
+                    (pn-chat
+                     (wasabi--log "Merged %s into %s" pn-jid lid-jid)
+                     (let ((pn-stamp (or (map-elt pn-chat :last-updated) ""))
+                           (lid-stamp (or (map-elt chat :last-updated) "")))
+                       (cons (cons :history-jids (list lid-jid pn-jid))
+                             (cons (cons :last-updated
+                                         (if (string> pn-stamp lid-stamp) pn-stamp lid-stamp))
+                                   (assq-delete-all :last-updated (copy-alist chat))))))
+                    (t chat))))
+               chats-index))))))
 
 ;; Protocol parsing functions
 
@@ -1437,7 +1569,8 @@ Returns list of internal chat entry alists, filtered and sorted."
                                  (unless (string= (car p-entry) "status@broadcast")
                                    (wasabi--parse-chat-index-entry p-entry contacts groups)))
                                p-chat-index)))
-         (sorted (sort parsed
+         (merged (wasabi--merge-lid-chats parsed))
+         (sorted (sort merged
                        (lambda (a b)
                          (string> (or (map-elt a :last-updated) "")
                                   (or (map-elt b :last-updated) ""))))))
