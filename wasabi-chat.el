@@ -251,42 +251,28 @@ REACTIONS is a hash table of message-id -> list of reactions."
 
 (cl-defun wasabi-chat--parse-notification (&key p-message p-info contact-name chat-jid contacts)
   "Parse protocol notification MESSAGE and INFO into internal message format.
-Returns alist with :sender-name, :timestamp, :content.
-For reaction messages, also includes :is-reaction, :target-id, and :emoji."
-  (if-let ((reaction-msg (map-elt p-message 'reactionMessage)))
-      ;; This is a reaction
-      (let* ((target-id (map-nested-elt reaction-msg '(key ID)))
-             (emoji (map-elt reaction-msg 'text))
-             (sender-jid (map-elt p-info 'Sender))
-             (sender-name (if (map-elt p-info 'IsFromMe)
-                              "Me"
-                            (or contact-name
-                                (map-elt p-info 'PushName)
-                                (when sender-jid
-                                  (if (string-match "\\([^@]+\\)@" sender-jid)
-                                      (match-string 1 sender-jid)
-                                    sender-jid))
-                                chat-jid))))
+Returns alist with :message-id, :sender-name, :timestamp, :content.
+For reaction messages, also includes :is-reaction, :target-id, and :emoji.
+CONTACTS is the internal contacts alist, used for sender name resolution."
+  ;; `wasabi-chat--parse-sender-name' takes the database shape, where Info is
+  ;; nested under the message. Notifications hand us Info on its own.
+  (let ((sender-name (wasabi-chat--parse-sender-name
+                      (list (cons 'Info p-info))
+                      (or (map-elt p-info 'Sender) chat-jid)
+                      :contacts contacts
+                      :contact-name contact-name)))
+    (if-let* ((reaction-msg (map-elt p-message 'reactionMessage)))
+        ;; This is a reaction
         `((:is-reaction . t)
-          (:target-id . ,target-id)
-          (:emoji . ,emoji)
-          (:sender-name . ,sender-name)))
-    ;; Regular message
-    (let* ((is-from-me (map-elt p-info 'IsFromMe))
-           (sender-name (if is-from-me
-                            "Me"
-                          (or contact-name
-                              (map-elt p-info 'PushName)
-                              (when-let ((sender (map-elt p-info 'Sender)))
-                                (if (string-match "\\([^@]+\\)@" sender)
-                                    (match-string 1 sender)
-                                  sender))
-                              chat-jid)))
-           (content (wasabi-chat--parse-content p-message))
-           (timestamp (map-elt p-info 'Timestamp)))
-      `((:sender-name . ,sender-name)
-        (:timestamp . ,timestamp)
-        (:content . ,content)))))
+          (:target-id . ,(map-nested-elt reaction-msg '(key ID)))
+          (:emoji . ,(map-elt reaction-msg 'text))
+          (:sender-name . ,sender-name))
+      ;; Regular message. :message-id is what `wasabi-chat--add-reaction' keys
+      ;; off, so reactions can only attach to messages that carry it.
+      `((:message-id . ,(map-elt p-info 'ID))
+        (:sender-name . ,sender-name)
+        (:timestamp . ,(map-elt p-info 'Timestamp))
+        (:content . ,(wasabi-chat--parse-content p-message))))))
 
 (cl-defun wasabi-chat--parse-reactions (p-messages &key contacts)
   "Parse reactions from P-MESSAGES and return a hash map of message-id -> reactions.
