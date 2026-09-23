@@ -546,7 +546,8 @@ Shows different bindings depending on whether point is in input area."
                      ;; Response Timestamp is Unix timestamp (integer),
                      ;; convert to ISO 8601 string.
                      (let* ((timestamp-str (format-time-string "%Y-%m-%dT%H:%M:%S%z" (map-elt response 'Timestamp)))
-                            (message `((:sender-name . "Me")
+                            (message `((:message-id . ,(map-elt response 'Id))
+                                       (:sender-name . "Me")
                                        (:timestamp . ,timestamp-str)
                                        (:content . ,text))))
                        (with-current-buffer chat-buffer
