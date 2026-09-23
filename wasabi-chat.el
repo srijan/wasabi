@@ -182,6 +182,24 @@ Returns string like \"Hello\" or \"[image]\"."
     ;; (message "[unknown]\n\n%s" p-message)
     "[unknown]")))
 
+(defun wasabi-chat--parse-edited-content (p-edited-message)
+  "Parse P-EDITED-MESSAGE and append an edited marker."
+  (concat (wasabi-chat--parse-content p-edited-message)
+          (propertize " (edited)" 'face 'font-lock-comment-face)))
+
+(defun wasabi-chat--parse-edit (p-message)
+  "Parse P-MESSAGE as an edit of an earlier message, or return nil.
+Returns an alist with :target-id, :content and :timestamp-ms.
+
+Identify edits by the presence of editedMessage in protocolMessage,
+rather than by the type enum."
+  (when-let* ((p-protocol (map-elt p-message 'protocolMessage))
+              (p-edited (map-elt p-protocol 'editedMessage))
+              (target-id (map-nested-elt p-protocol '(key ID))))
+    `((:target-id . ,target-id)
+      (:content . ,(wasabi-chat--parse-edited-content p-edited))
+      (:timestamp-ms . ,(or (map-elt p-protocol 'timestampMS) 0)))))
+
 (cl-defun wasabi-chat--parse-sender-name (p-data p-sender-jid &key contacts contact-name)
   "Parse sender name from P-DATA and P-SENDER-JID.
 CONTACTS is the internal contacts alist for name resolution.
@@ -206,12 +224,14 @@ CONTACT-NAME is an optional fallback name."
                  p-sender-jid))
           "Unknown")))))
 
-(cl-defun wasabi-chat--parse-message (p-message &key chat-jid contact-name contacts reactions)
-  "Parse a protocol message (from database) into internal display format.
-Returns alist with :sender-name, :timestamp, :content, :message-id, and :reactions.
-Returns nil for reaction messages (they're handled separately).
-CONTACTS should be internal contacts alist for sender name resolution.
-REACTIONS is a hash table of message-id -> list of reactions."
+(cl-defun wasabi-chat--parse-message (p-message &key chat-jid contact-name contacts reactions edits)
+  "Parse database row P-MESSAGE into an internal display message.
+Return an alist with :sender-name, :timestamp, :content, :message-id,
+and optional :reactions, or nil for reaction and edit rows.
+CONTACTS is the internal contacts alist for sender name resolution.
+CHAT-JID and CONTACT-NAME provide fallback sender names.
+REACTIONS maps message IDs to reaction lists; EDITS maps them to edited
+content.  Both are hash tables."
   (let* ((data-json (map-elt p-message 'data_json))
          (timestamp (map-elt p-message 'timestamp))
          (msg-id (map-elt p-message 'message_id)))
@@ -220,26 +240,32 @@ REACTIONS is a hash table of message-id -> list of reactions."
         (let ((p-data (json-parse-string data-json :object-type 'alist
                                          :null-object nil
                                          :false-object nil)))
-          ;; Skip reaction messages - they're already in reactions.
-          (unless (map-nested-elt p-data '(Message reactionMessage))
+          ;; Reaction and edit rows are already folded into the message
+          ;; they point at.
+          (unless (or (map-nested-elt p-data '(Message reactionMessage))
+                      (wasabi-chat--parse-edit (map-elt p-data 'Message)))
             (let* ((p-sender-jid (map-nested-elt p-data '(Info Sender)))
                    (p-sender-name (wasabi-chat--parse-sender-name p-data p-sender-jid
                                                                   :contacts contacts
-                                                                  :contact-name contact-name)))
+                                                                  :contact-name contact-name))
+                   (content (or (map-elt edits msg-id)
+                                (wasabi-chat--parse-content (map-elt p-data 'Message)))))
               (if (and msg-id reactions (map-elt reactions msg-id))
                   `((:message-id . ,msg-id)
                     (:sender-name . ,p-sender-name)
                     (:timestamp . ,(map-nested-elt p-data '(Info Timestamp)))
-                    (:content . ,(wasabi-chat--parse-content (map-elt p-data 'Message)))
+                    (:content . ,content)
                     (:reactions . ,(reverse (map-elt reactions msg-id))))
                 `((:message-id . ,msg-id)
                   (:sender-name . ,p-sender-name)
                   (:timestamp . ,(map-nested-elt p-data '(Info Timestamp)))
-                  (:content . ,(wasabi-chat--parse-content (map-elt p-data 'Message))))))))
+                  (:content . ,content))))))
       ;; Fallback: parse from basic fields (outgoing messages without data_json)
       (let* ((is-from-me (string= (map-elt p-message 'sender_jid) "me"))
              (sender-name (if is-from-me "Me" (or contact-name chat-jid)))
-             (content (or (map-elt p-message 'text_content) "[message]"))
+             (content (or (map-elt edits msg-id)
+                          (map-elt p-message 'text_content)
+                          "[message]"))
              (reactions (when (and msg-id reactions)
                           (map-elt reactions msg-id))))
         (if reactions
@@ -254,10 +280,12 @@ REACTIONS is a hash table of message-id -> list of reactions."
             (:content . ,content)))))))
 
 (cl-defun wasabi-chat--parse-notification (&key p-message p-info contact-name chat-jid contacts)
-  "Parse protocol notification MESSAGE and INFO into internal message format.
-Returns alist with :message-id, :sender-name, :timestamp, :content.
-For reaction messages, also includes :is-reaction, :target-id, and :emoji.
-CONTACTS is the internal contacts alist, used for sender name resolution."
+  "Parse notification P-MESSAGE and P-INFO into an internal message alist.
+All results include :sender-name.  Regular messages include :message-id,
+:timestamp and :content; reactions include :is-reaction, :target-id and
+:emoji; edits include :is-edit, :target-id and replacement :content.
+CONTACTS is the internal contacts alist for sender name resolution.
+CHAT-JID and CONTACT-NAME provide fallbacks for the sender JID and name."
   ;; `wasabi-chat--parse-sender-name' takes the database shape, where Info is
   ;; nested under the message. Notifications hand us Info on its own.
   (let ((sender-name (wasabi-chat--parse-sender-name
@@ -265,18 +293,26 @@ CONTACTS is the internal contacts alist, used for sender name resolution."
                       (or (map-elt p-info 'Sender) chat-jid)
                       :contacts contacts
                       :contact-name contact-name)))
-    (if-let* ((reaction-msg (map-elt p-message 'reactionMessage)))
-        ;; This is a reaction
+    (cond
+     ((map-elt p-message 'reactionMessage)
+      (let ((reaction-msg (map-elt p-message 'reactionMessage)))
         `((:is-reaction . t)
           (:target-id . ,(map-nested-elt reaction-msg '(key ID)))
           (:emoji . ,(map-elt reaction-msg 'text))
-          (:sender-name . ,sender-name))
+          (:sender-name . ,sender-name))))
+     ((wasabi-chat--parse-edit p-message)
+      (let ((edit (wasabi-chat--parse-edit p-message)))
+        `((:is-edit . t)
+          (:target-id . ,(map-elt edit :target-id))
+          (:content . ,(map-elt edit :content))
+          (:sender-name . ,sender-name))))
+     (t
       ;; Regular message. :message-id is what `wasabi-chat--add-reaction' keys
       ;; off, so reactions can only attach to messages that carry it.
       `((:message-id . ,(map-elt p-info 'ID))
         (:sender-name . ,sender-name)
         (:timestamp . ,(map-elt p-info 'Timestamp))
-        (:content . ,(wasabi-chat--parse-content p-message))))))
+        (:content . ,(wasabi-chat--parse-content p-message)))))))
 
 (cl-defun wasabi-chat--parse-reactions (p-messages &key contacts)
   "Parse reactions from P-MESSAGES and return a hash map of message-id -> reactions.
@@ -300,18 +336,40 @@ CONTACTS is used to resolve sender names."
                         (map-elt reactions p-target-id)))))
     reactions))
 
+(defun wasabi-chat--parse-edits (p-messages)
+  "Return a hash table mapping target message IDs to edits from P-MESSAGES.
+Values are edited content strings.  The highest timestampMS wins when
+multiple edits target the same message."
+  (let ((edits (make-hash-table :test 'equal))
+        (parsed nil))
+    (dolist (p-msg (append p-messages nil))
+      (when-let* ((data-json (map-elt p-msg 'data_json))
+                  ((not (string-empty-p data-json)))
+                  (p-data (json-parse-string data-json :object-type 'alist
+                                             :null-object nil
+                                             :false-object nil))
+                  (edit (wasabi-chat--parse-edit (map-elt p-data 'Message))))
+        (push edit parsed)))
+    (dolist (edit (sort parsed (lambda (a b)
+                                 (< (map-elt a :timestamp-ms)
+                                    (map-elt b :timestamp-ms))))
+                  edits)
+      (map-put! edits (map-elt edit :target-id) (map-elt edit :content)))))
+
 (cl-defun wasabi-chat--parse-messages (p-messages &key chat-jid contact-name contacts)
   "Parse array of protocol messages into list of internal display messages.
 Returns list of message alists, sorted by timestamp (oldest first).
 Messages with reactions will have a :reactions field."
   (let* ((reactions (wasabi-chat--parse-reactions p-messages :contacts contacts))
+         (edits (wasabi-chat--parse-edits p-messages))
          (parsed (delq nil
                        (mapcar (lambda (p-msg)
                                  (wasabi-chat--parse-message p-msg
                                                              :chat-jid chat-jid
                                                              :contact-name contact-name
                                                              :contacts contacts
-                                                             :reactions reactions))
+                                                             :reactions reactions
+                                                             :edits edits))
                                (append p-messages nil)))))
     (sort parsed
           (lambda (a b)
@@ -743,20 +801,16 @@ Updates :messages list and :max-sender-width in chat state."
 		         (truncate (/ (window-body-height) 4.0)))) t)
     (wasabi-chat--update-header-line)))
 
-(cl-defun wasabi-chat--add-reaction (&key target-id emoji sender)
-  "Add a reaction to an existing message with TARGET-ID.
-EMOJI is the reaction emoji, SENDER is the name of who reacted.
-Finds the message in :messages, updates it, and re-renders just that message."
+(cl-defun wasabi-chat--update-message (&key target-id update-fn)
+  "Update and re-render the message with TARGET-ID using UPDATE-FN.
+UPDATE-FN takes the current message alist and returns its replacement."
   (unless (derived-mode-p 'wasabi-chat-mode)
     (error "Not in a chat buffer"))
-  (wasabi--log "add-reaction called with target-id: %s, emoji: %s, sender: %s" target-id emoji sender)
   (if-let* ((target-idx (seq-position (map-elt wasabi-chat--chat :messages)
                                       target-id
                                       (lambda (msg id) (string= (map-elt msg :message-id) id))))
             (target-msg (nth target-idx (map-elt wasabi-chat--chat :messages)))
-            (updated-msg (cons `(:reactions . ,(append (map-elt target-msg :reactions)
-                                                       (list `((:emoji . ,emoji) (:sender . ,sender)))))
-                               (assq-delete-all :reactions (copy-alist target-msg))))
+            (updated-msg (funcall update-fn target-msg))
             (updated-messages (append (seq-take (map-elt wasabi-chat--chat :messages) target-idx)
                                       (list updated-msg)
                                       (seq-drop (map-elt wasabi-chat--chat :messages) (1+ target-idx)))))
@@ -802,7 +856,27 @@ Finds the message in :messages, updates it, and re-renders just that message."
                 ;; Ensure newline before prompt.
                 (unless next-sender
                   (insert "\n\n")))))))
-    (wasabi--log "Could not find message with ID %s to add reaction" target-id)))
+    (wasabi--log "Could not find message with ID %s to update" target-id)))
+
+(cl-defun wasabi-chat--add-reaction (&key target-id emoji sender)
+  "Add a reaction to an existing message with TARGET-ID.
+EMOJI is the reaction emoji; SENDER names the person who reacted."
+  (wasabi--log "add-reaction called with target-id: %s, emoji: %s, sender: %s" target-id emoji sender)
+  (wasabi-chat--update-message
+   :target-id target-id
+   :update-fn (lambda (msg)
+                (cons `(:reactions . ,(append (map-elt msg :reactions)
+                                              (list `((:emoji . ,emoji) (:sender . ,sender)))))
+                      (assq-delete-all :reactions (copy-alist msg))))))
+
+(cl-defun wasabi-chat--edit-message (&key target-id content)
+  "Replace the content of the message with TARGET-ID with CONTENT."
+  (wasabi--log "edit-message called with target-id: %s" target-id)
+  (wasabi-chat--update-message
+   :target-id target-id
+   :update-fn (lambda (msg)
+                (cons `(:content . ,content)
+                      (assq-delete-all :content (copy-alist msg))))))
 
 (cl-defun wasabi-chat--start (&key chat-jid messages contact-name)
   "Create and display a chat buffer for CHAT-JID.

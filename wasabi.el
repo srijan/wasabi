@@ -753,13 +753,21 @@ Calls ON-FAILURE with error if download fails."
                                                              :contact-name (map-elt wasabi-chat--chat :contact-name)
                                                              :chat-jid chat-jid
                                                              :contacts contacts))))
-									 (wasabi--notify message)
-                                     (if (map-elt message :is-reaction)
-                                         (wasabi-chat--add-reaction
-                                          :target-id (map-elt message :target-id)
-                                          :emoji (map-elt message :emoji)
-                                          :sender (map-elt message :sender-name))
-                                       (wasabi-chat--append-message message)))))))
+                                     ;; An edit isn't new mail: the message
+                                     ;; it rewrites was already notified.
+                                     (unless (map-elt message :is-edit)
+                                       (wasabi--notify message))
+                                     (cond ((map-elt message :is-reaction)
+                                            (wasabi-chat--add-reaction
+                                             :target-id (map-elt message :target-id)
+                                             :emoji (map-elt message :emoji)
+                                             :sender (map-elt message :sender-name)))
+                                           ((map-elt message :is-edit)
+                                            (wasabi-chat--edit-message
+                                             :target-id (map-elt message :target-id)
+                                             :content (map-elt message :content)))
+                                           (t
+                                            (wasabi-chat--append-message message))))))))
                             ((equal (map-elt notification 'method) "HistorySync")
                              (wasabi--log "HistorySync received")
                              (wasabi--log "HistorySync: current-buffer=%s, major-mode=%s" (current-buffer) major-mode)

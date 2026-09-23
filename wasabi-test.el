@@ -58,6 +58,67 @@ last-resort fallback."
     (should (equal "TARGET1" (map-elt parsed :target-id)))
     (should (equal "Janey" (map-elt parsed :sender-name)))))
 
+;;; Edits
+
+(defun wasabi-test--row (message-id json)
+  "Return a message_history row for MESSAGE-ID with JSON as data_json."
+  `((message_id . ,message-id)
+    (data_json . ,(json-serialize json))))
+
+(defun wasabi-test--edit-row (message-id target-id text timestamp-ms)
+  "Return edit row MESSAGE-ID replacing TARGET-ID with TEXT at TIMESTAMP-MS."
+  (wasabi-test--row
+   message-id
+   `((Info . ((ID . ,message-id) (Sender . "123@s.whatsapp.net")
+              (Timestamp . "2026-09-01T10:05:00Z")))
+     (Message . ((protocolMessage . ((key . ((ID . ,target-id)))
+                                     (type . "14")
+                                     (timestampMS . ,timestamp-ms)
+                                     (editedMessage . ((conversation . ,text))))))))))
+
+(ert-deftest wasabi-test-notification-edit-shape ()
+  "Parsing a live edit yields its target ID and replacement content."
+  (let ((parsed (wasabi-chat--parse-notification
+                 :p-message '((protocolMessage . ((key . ((ID . "TARGET1")))
+                                                  (type . "14")
+                                                  (timestampMS . 1787697290778)
+                                                  (editedMessage . ((conversation . "fixed"))))))
+                 :p-info '((ID . "EDIT1") (Sender . "123@s.whatsapp.net"))
+                 :contact-name nil
+                 :chat-jid "123@s.whatsapp.net"
+                 :contacts nil)))
+    (should (map-elt parsed :is-edit))
+    (should (equal "TARGET1" (map-elt parsed :target-id)))
+    (should (string-prefix-p "fixed" (map-elt parsed :content)))))
+
+(ert-deftest wasabi-test-history-folds-edit-into-target ()
+  "History parsing folds an edit into its target message."
+  (let* ((rows (list (wasabi-test--row
+                      "ORIG1"
+                      '((Info . ((ID . "ORIG1") (Sender . "123@s.whatsapp.net")
+                                 (Timestamp . "2026-09-01T10:00:00Z")))
+                        (Message . ((conversation . "typo here")))))
+                     (wasabi-test--edit-row "EDIT1" "ORIG1" "fixed" 1787697290778)))
+         (parsed (wasabi-chat--parse-messages rows :chat-jid "123@s.whatsapp.net"
+                                              :contact-name nil :contacts nil)))
+    (should (equal 1 (length parsed)))
+    (should (equal "ORIG1" (map-elt (car parsed) :message-id)))
+    (should (string-prefix-p "fixed" (map-elt (car parsed) :content)))))
+
+(ert-deftest wasabi-test-history-newest-edit-wins ()
+  "The latest edit wins even when history rows arrive out of order."
+  (let* ((rows (list (wasabi-test--row
+                      "ORIG1"
+                      '((Info . ((ID . "ORIG1") (Sender . "123@s.whatsapp.net")
+                                 (Timestamp . "2026-09-01T10:00:00Z")))
+                        (Message . ((conversation . "first")))))
+                     (wasabi-test--edit-row "EDIT2" "ORIG1" "newest" 2000)
+                     (wasabi-test--edit-row "EDIT1" "ORIG1" "older" 1000)))
+         (parsed (wasabi-chat--parse-messages rows :chat-jid "123@s.whatsapp.net"
+                                              :contact-name nil :contacts nil)))
+    (should (equal 1 (length parsed)))
+    (should (string-prefix-p "newest" (map-elt (car parsed) :content)))))
+
 (ert-deftest wasabi-test-chat-preview-pads-unparsable-timestamp ()
   "An empty string is truthy, so the time column has to collapse to nil."
   (let ((bad (wasabi--format-chat-preview :display-name "X" :is-group nil
